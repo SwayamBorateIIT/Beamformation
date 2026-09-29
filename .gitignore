@@ -1,0 +1,4 @@
+data/
+results/**/*.pt
+results/**/*.npz
+__pycache__/
