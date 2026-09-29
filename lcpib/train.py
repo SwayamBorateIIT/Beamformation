@@ -77,11 +77,12 @@ def train(args):
     print(f"{len(data)} training phantoms; median rho2 to farthest angle per band:",
           np.round(np.median([d["rho2"][:, 3, 0] for d in data], 0), 3), flush=True)
 
-    model = LCPIB(use_apod=not args.no_apod)
+    dev = torch.device(args.device)
+    model = LCPIB(use_apod=not args.no_apod).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.steps, pct_start=0.1)
     H = W = args.patch
-    zt, xt = torch.from_numpy(z), torch.from_numpy(x)
+    zt, xt = torch.from_numpy(z).to(dev), torch.from_numpy(x).to(dev)
     log = []
     t_start = time.time()
     for step in range(args.steps):
@@ -89,8 +90,8 @@ def train(args):
         A = len(d["angles"])
         a = 3 if rng.random() < 0.5 else int(rng.integers(A))
         frame = int(rng.integers(2))
-        iq1 = torch.from_numpy((d["iq"], d["iq2"])[frame][a])
-        iq2 = torch.from_numpy((d["iq2"], d["iq"])[frame][a])
+        iq1 = torch.from_numpy((d["iq"], d["iq2"])[frame][a]).to(dev)
+        iq2 = torch.from_numpy((d["iq2"], d["iq"])[frame][a]).to(dev)
         i0 = int(rng.integers(0, NZ - H)); j0 = int(rng.integers(0, NX - W))
         zz, xx = torch.meshgrid(zt[i0:i0 + H], xt[j0:j0 + W], indexing="ij")
         zz, xx = zz.reshape(-1), xx.reshape(-1)
@@ -99,7 +100,7 @@ def train(args):
             d_all = delay_gather(iq1, 2 * 20.832e6, d["t0"], ang, zz, xx, 1540.0)
             d_two = delay_gather(iq2, 2 * 20.832e6, d["t0"], ang, zz, xx, 1540.0)
         masked = (not args.no_ch) and rng.random() < 0.5
-        keep = torch.ones(N_EL)
+        keep = torch.ones(N_EL, device=dev)
         if masked:
             xc = float(xt[j0 + W // 2]); ec = int(round(xc / 0.3e-3 + (N_EL - 1) / 2))
             c0 = int(np.clip(ec + rng.integers(-8, 9) - 8, 0, N_EL - 16))
@@ -130,7 +131,7 @@ def train(args):
                     V = [others[int(np.argmin(r2[others]))]]
                 R = d["rho2"][band][np.ix_(V, V)]
                 L_B = float(len(V) ** 2 / R.sum())             # effective number of looks
-            J = torch.from_numpy(np.mean(np.abs(d["Y"][V, i0:i0 + H, j0:j0 + W]) ** 2, 0))
+            J = torch.from_numpy(np.mean(np.abs(d["Y"][V, i0:i0 + H, j0:j0 + W]) ** 2, 0)).to(dev)
             if args.xv_mse:
                 losses["xv"] = ((torch.log(m_tot) - torch.log(J.clamp_min(1e-12))) ** 2).mean()
             else:
@@ -163,7 +164,7 @@ def train(args):
             nb = [b for b in (a - 1, a + 1) if 0 <= b < A]
             lc = 0
             for b in nb:
-                yb = torch.from_numpy(d["Y"][b, i0:i0 + H, j0:j0 + W])
+                yb = torch.from_numpy(d["Y"][b, i0:i0 + H, j0:j0 + W]).to(dev)
                 num = smooth(o["y_pp"] * yb.conj(), model.kw)
                 den = torch.sqrt((smooth(abs2(o["y_pp"]), model.kw) * smooth(abs2(yb), model.kw)).clamp_min(1e-20))
                 lc = lc + math.sqrt(d["rho2"][band][a, b]) * (1 - num.real / den).mean()
@@ -195,7 +196,7 @@ def train(args):
             mean = {k: np.mean([r[k] for r in log[-50:] if k in r]) for k in rec if k != "step"}
             print(step, f"{time.time() - t_start:.0f}s", {k: round(v, 4) for k, v in mean.items()}, flush=True)
     os.makedirs(args.out, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.out, "model.pt"))
+    torch.save(model.cpu().state_dict(), os.path.join(args.out, "model.pt"))
     json.dump(dict(args=vars(args), log=log), open(os.path.join(args.out, "train_log.json"), "w"))
 
 
@@ -209,6 +210,7 @@ if __name__ == "__main__":
     ap.add_argument("--eps", type=float, default=0.1)
     ap.add_argument("--l_coh", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no_ch", action="store_true")
     ap.add_argument("--no_xv", action="store_true")
     ap.add_argument("--no_coh", action="store_true")

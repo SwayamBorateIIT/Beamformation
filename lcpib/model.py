@@ -97,43 +97,7 @@ class LCPIB(nn.Module):
         self.register_buffer("el_x", torch.as_tensor(ELEMENT_X, dtype=torch.float32))
         self.register_buffer("kw", gauss_kernel(*win))
         self.register_buffer("kbig", gauss_kernel(16.0, 12.0))
-        # axial high-pass on beamformed baseband IQ: keeps |f - f0| > 2.8 MHz (outside the
-        # two-way echo band, inside the receiver noise band) -> single-frame noise cue.
-        fs_z = C0 / (2 * dz)
-        self.register_buffer("hp", torch.tensor(firwin(31, 2.8e6 / (fs_z / 2), pass_zero=False), dtype=torch.float32))
-        self.apod = ApodNet()
-        self.n_feat = 13 + K
-        self.stages = nn.ModuleList([Stage(self.n_feat + 6) for _ in range(T)])
-        self.eta = nn.Parameter(torch.full((T,), 0.3))
-
-    def forward(self, f):
-        o = self.net(f)
-        return torch.complex(o[:, 0], o[:, 1])
-
-
-class Stage(nn.Module):
-    def __init__(self, cin, ch=32):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(cin, ch, 3, padding=1), nn.GELU(),
-            nn.Conv2d(ch, ch, 3, padding=2, dilation=2), nn.GELU(),
-            nn.Conv2d(ch, ch, 3, padding=4, dilation=4), nn.GELU(),
-            nn.Conv2d(ch, ch, 3, padding=1), nn.GELU(),
-            nn.Conv2d(ch, 4, 1))
-        nn.init.zeros_(self.net[-1].weight); nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class LCPIB(nn.Module):
-    def __init__(self, K=4, overlap=0.5, T=4, beta=3.0, coarse=4, win=(4.0, 3.0), use_apod=True, dz=45e-3 / 511):
-        super().__init__()
-        self.K, self.T, self.beta, self.coarse, self.use_apod = K, T, beta, coarse, use_apod
-        self.register_buffer("looks", torch.from_numpy(look_windows(K, overlap)))
-        self.register_buffer("el_x", torch.as_tensor(ELEMENT_X, dtype=torch.float32))
-        self.register_buffer("kw", gauss_kernel(*win))
-        self.register_buffer("kbig", gauss_kernel(16.0, 12.0))
+        self.register_buffer("kfrac", gauss_kernel(12.0, 8.0))      # ~1 mm x 1.2 mm
         # axial high-pass on beamformed baseband IQ: keeps |f - f0| > 2.8 MHz (outside the
         # two-way echo band, inside the receiver noise band) -> single-frame noise cue.
         fs_z = C0 / (2 * dz)
@@ -155,7 +119,7 @@ class LCPIB(nn.Module):
         d = d_pre if d_pre is not None else delay_gather(iq_t, fs, t0, angle, zz, xx, c, el_x=self.el_x)
         M = aperture_mask(zz, xx, fnum=FNUM, el_x=self.el_x)
         if chan_keep is None:
-            chan_keep = torch.ones(N_EL)
+            chan_keep = torch.ones(N_EL, device=zz.device)
         Mk = M * chan_keep[None, :]
         d = d * Mk
         # reference apodization (Hann over F# aperture, masked channels removed, sum 1)
@@ -220,7 +184,7 @@ class LCPIB(nn.Module):
         rho2 = (abs2(C) / dg ** 2).clamp(0, 1)
         n_w = self.n_window(Yref)
         rho2c = ((rho2 - 1 / n_w) / (1 - 1 / n_w)).clamp(0, 1)
-        eye = torch.eye(self.K)[:, :, None, None]
+        eye = torch.eye(self.K, device=zz.device)[:, :, None, None]
         rho2c = rho2c * (1 - eye) + eye
         L_eff = I_k.sum(0) ** 2 / (I_k[:, None] * I_k[None] * rho2c).sum((0, 1)).clamp_min(EPS)
         # channel coherence (LOC-type) at lags 1, 2, 4, 8
@@ -266,7 +230,14 @@ class LCPIB(nn.Module):
             v = v - self.eta[t] * gv + o[1].clamp(-3, 3)
             nu = nu - self.eta[t] * gn + o[2].clamp(-3, 3)
             logL = logL + o[3]
-        sig, clu, noi = torch.exp(u), torch.exp(v), torch.exp(nu)
+        # Despeckled total power m (speckle-independent targets: L_xv, L_E) times *regionally
+        # smoothed* component fractions: the coherent / noise fractions are ensemble properties,
+        # their per-pixel values fluctuate like the coherence-factor estimator itself.
+        m_tot = torch.exp(u) + torch.exp(v) + torch.exp(nu)
+        f_s = smooth(torch.exp(u) / m_tot, self.kfrac)
+        f_n = smooth(torch.exp(nu) / m_tot, self.kfrac)
+        f_c = (1 - f_s - f_n).clamp_min(1e-4)
+        sig, clu, noi = f_s * m_tot, f_c * m_tot, f_n * m_tot
         gain = sig / (sig + clu + noi)
         return dict(y=Y, y_ref=Yref, y_pp=gain * Y, sigma2=sig, clutter=clu, noise=noi, gain=gain,
                     L_hat=torch.exp(logL.clamp(-4, 6)), L_eff=L_eff, rho2=rho2c, I_ref=I_ref, n0=n0, P_oob=P_oob,
@@ -290,4 +261,4 @@ class LCPIB(nn.Module):
         vv = F.conv2d(v[None, None], v[None, None], padding=(2 * kz, 2 * kx))[0, 0]  # autocorr of window
         vv = vv[: rho2.shape[0], : rho2.shape[1]]
         n = (v.sum() ** 2) / (vv * rho2).sum().clamp_min(EPS)
-        return float(n.clamp(1.0, 1e4))
+        return float(n.clamp(1.0, 1e4).cpu())
