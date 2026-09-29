@@ -240,7 +240,7 @@ class LCPIB(nn.Module):
         sig, clu, noi = f_s * m_tot, f_c * m_tot, f_n * m_tot
         gain = sig / (sig + clu + noi)
         return dict(y=Y, y_ref=Yref, y_pp=gain * Y, sigma2=sig, clutter=clu, noise=noi, gain=gain,
-                    L_hat=torch.exp(logL.clamp(-4, 6)), L_eff=L_eff, rho2=rho2c, I_ref=I_ref, n0=n0, P_oob=P_oob,
+                    L_hat=0.05 + F.softplus(logL + 0.5413) * 1.0, L_eff=L_eff, rho2=rho2c, I_ref=I_ref, n0=n0, P_oob=P_oob,
                     gamma=gam, s_coh=s_coh, E_ch=E_ch, w=w, w0=w0, d=d, Mk=Mk, n_w=n_w, dw=dw_img,
                     z_looks=Z)
 
