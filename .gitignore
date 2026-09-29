@@ -3,3 +3,5 @@ results/**/*.pt
 results/**/*.npz
 __pycache__/
 results/debug/
+results/train_*.log
+results/full/
