@@ -54,9 +54,13 @@ def precompute(path, z, x):
     return Y, rho2
 
 
-def gamma_nll(J, m, L=1.0):
-    """Gamma negative log-likelihood (mean m, shape L) up to terms constant in m."""
-    return L * (J / m + torch.log(m))
+def gamma_nll(J, m, L=1.0, tau=20.0):
+    """Gamma negative log-likelihood (mean m, shape L) up to terms constant in m.
+    Robustified for J/m > tau (log growth instead of linear) so that a collapsed estimate on
+    a single patch cannot dominate the gradient; identical to the exact NLL for J/m <= tau."""
+    rho = J / m
+    rob = torch.where(rho <= tau, rho, tau * (1 + torch.log(rho.clamp_min(tau) / tau)))
+    return L * (rob + torch.log(m))
 
 
 def train(args):
