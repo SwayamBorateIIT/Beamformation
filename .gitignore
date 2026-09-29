@@ -5,3 +5,5 @@ __pycache__/
 results/debug/
 results/train_*.log
 results/full/
+results/run_all.log
+results/eval_*.log
