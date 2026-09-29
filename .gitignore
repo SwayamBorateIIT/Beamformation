@@ -2,3 +2,4 @@ data/
 results/**/*.pt
 results/**/*.npz
 __pycache__/
+results/debug/
