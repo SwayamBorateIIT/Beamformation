@@ -12,7 +12,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import ELEMENT_X, N_EL, aperture_mask, delay_gather, hann_apod, look_windows
+from scipy.signal import firwin
+
+from .common import C0, F0, ELEMENT_X, N_EL, aperture_mask, delay_gather, hann_apod, look_windows
 
 FNUM = 1.5
 EPS = 1e-12
@@ -88,15 +90,19 @@ class Stage(nn.Module):
 
 
 class LCPIB(nn.Module):
-    def __init__(self, K=4, overlap=0.5, T=4, beta=3.0, coarse=4, win=(4.0, 3.0), use_apod=True):
+    def __init__(self, K=4, overlap=0.5, T=4, beta=3.0, coarse=4, win=(4.0, 3.0), use_apod=True, dz=45e-3 / 511):
         super().__init__()
         self.K, self.T, self.beta, self.coarse, self.use_apod = K, T, beta, coarse, use_apod
         self.register_buffer("looks", torch.from_numpy(look_windows(K, overlap)))
         self.register_buffer("el_x", torch.as_tensor(ELEMENT_X, dtype=torch.float32))
         self.register_buffer("kw", gauss_kernel(*win))
         self.register_buffer("kbig", gauss_kernel(16.0, 12.0))
+        # axial high-pass on beamformed baseband IQ: keeps |f - f0| > 2.8 MHz (outside the
+        # two-way echo band, inside the receiver noise band) -> single-frame noise cue.
+        fs_z = C0 / (2 * dz)
+        self.register_buffer("hp", torch.tensor(firwin(31, 2.8e6 / (fs_z / 2), pass_zero=False), dtype=torch.float32))
         self.apod = ApodNet()
-        self.n_feat = 12 + K
+        self.n_feat = 13 + K
         self.stages = nn.ModuleList([Stage(self.n_feat + 6) for _ in range(T)])
         self.eta = nn.Parameter(torch.full((T,), 0.3))
 
@@ -121,15 +127,19 @@ class Stage(nn.Module):
 
 
 class LCPIB(nn.Module):
-    def __init__(self, K=4, overlap=0.5, T=4, beta=3.0, coarse=4, win=(4.0, 3.0), use_apod=True):
+    def __init__(self, K=4, overlap=0.5, T=4, beta=3.0, coarse=4, win=(4.0, 3.0), use_apod=True, dz=45e-3 / 511):
         super().__init__()
         self.K, self.T, self.beta, self.coarse, self.use_apod = K, T, beta, coarse, use_apod
         self.register_buffer("looks", torch.from_numpy(look_windows(K, overlap)))
         self.register_buffer("el_x", torch.as_tensor(ELEMENT_X, dtype=torch.float32))
         self.register_buffer("kw", gauss_kernel(*win))
         self.register_buffer("kbig", gauss_kernel(16.0, 12.0))
+        # axial high-pass on beamformed baseband IQ: keeps |f - f0| > 2.8 MHz (outside the
+        # two-way echo band, inside the receiver noise band) -> single-frame noise cue.
+        fs_z = C0 / (2 * dz)
+        self.register_buffer("hp", torch.tensor(firwin(31, 2.8e6 / (fs_z / 2), pass_zero=False), dtype=torch.float32))
         self.apod = ApodNet()
-        self.n_feat = 12 + K
+        self.n_feat = 13 + K
         self.stages = nn.ModuleList([Stage(self.n_feat + 6) for _ in range(T)])
         self.eta = nn.Parameter(torch.full((T,), 0.3))
 
@@ -228,15 +238,23 @@ class LCPIB(nn.Module):
         # separate noise; this is only an initialisation / feature.
         n0 = (E_ch * w0n).clamp_min(EPS)
 
+        # out-of-band (noise) power of the reference beamformer output
+        hp = self.hp.view(1, 1, -1, 1)
+        pad = hp.shape[2] // 2
+        yr = (Yref * torch.polar(torch.ones_like(Zimg := img(zz)), -4 * np.pi * F0 * Zimg / C0))[None, None]
+        yhp = torch.complex(F.conv2d(F.pad(yr.real, (0, 0, pad, pad), mode="reflect"), hp),
+                            F.conv2d(F.pad(yr.imag, (0, 0, pad, pad), mode="reflect"), hp))[0, 0]
+        P_oob = smooth(abs2(yhp), k).clamp_min(EPS)
+
         # ---- unrolled Gamma-MAP estimator (scale-equivariant via local log-normalisation)
         l0 = torch.log(smooth(I_ref, self.kbig).clamp_min(EPS))
         lg = lambda t: torch.log(t.clamp_min(EPS)) - l0
         zn = img(zz) / 0.05
         feat = torch.stack([lg(I_ref), lg(I_y), lg(I_k.mean(0)), *[lg(I_k[i]) for i in range(self.K)],
-                            *gam, s_coh, lg(n0), L_eff / self.K, zn, lg(E_ch * w0n)])[None]
+                            *gam, s_coh, lg(n0), L_eff / self.K, zn, lg(E_ch * w0n), lg(P_oob)])[None]
         u = torch.log((I_ref - n0).clamp_min(0.05 * I_ref).clamp_min(EPS))
         v = torch.log((0.05 * I_ref).clamp_min(EPS))
-        nu = torch.log(0.01 * n0)
+        nu = torch.log(3.0 * P_oob)
         logL = torch.zeros_like(u)
         for t, st in enumerate(self.stages):
             m = torch.exp(u) + torch.exp(v) + torch.exp(nu)
@@ -251,7 +269,7 @@ class LCPIB(nn.Module):
         sig, clu, noi = torch.exp(u), torch.exp(v), torch.exp(nu)
         gain = sig / (sig + clu + noi)
         return dict(y=Y, y_ref=Yref, y_pp=gain * Y, sigma2=sig, clutter=clu, noise=noi, gain=gain,
-                    L_hat=torch.exp(logL.clamp(-4, 6)), L_eff=L_eff, rho2=rho2c, I_ref=I_ref, n0=n0,
+                    L_hat=torch.exp(logL.clamp(-4, 6)), L_eff=L_eff, rho2=rho2c, I_ref=I_ref, n0=n0, P_oob=P_oob,
                     gamma=gam, s_coh=s_coh, E_ch=E_ch, w=w, w0=w0, d=d, Mk=Mk, n_w=n_w, dw=dw_img,
                     z_looks=Z)
 
